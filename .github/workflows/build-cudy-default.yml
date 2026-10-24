@@ -134,6 +134,12 @@ jobs:
         run: |
           cp defconfig/mt7981-ax3000.config .config
 
+          # --- 关键修正：模板写的是旧 subtarget 名 mt7981，当前分支已改名为 filogic，
+          #     不修正会导致 target/install 不生成任何镜像（编译成功但无固件）---
+          sed -i 's#^CONFIG_TARGET_mediatek_mt7981=y#CONFIG_TARGET_mediatek_filogic=y#' .config
+          sed -i 's#^CONFIG_TARGET_mediatek_mt7981=## CONFIG_TARGET_mediatek_mt7981 is not set#' .config
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y' .config || echo 'CONFIG_TARGET_mediatek_filogic=y' >> .config
+
           # --- 取消模板默认选中的所有设备，只保留 Cudy TR3000 v1 112M (ubootmod) ---
           sed -i -E 's#^CONFIG_TARGET_DEVICE_([A-Za-z0-9_]+_DEVICE_[A-Za-z0-9_.-]+)=y#\# CONFIG_TARGET_DEVICE_\1 is not set#' .config
           echo 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' >> .config
@@ -177,7 +183,14 @@ jobs:
           EOF
           sed -i 's/^          //' .config
 
+          # 两次 defconfig，确保 subtarget choice 与设备 profile 完全收敛
           make defconfig
+          make defconfig
+
+          echo '=== 最终 target 选择（必须为 filogic + cudy ubootmod）==='
+          grep -E '^CONFIG_TARGET_mediatek=y|^CONFIG_TARGET_mediatek_filogic=y|^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' .config
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y' .config || { echo '::error::subtarget 未选中 filogic'; exit 1; }
+          grep -q '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' .config || { echo '::error::cudy tr3000 ubootmod 设备未选中'; exit 1; }
 
       - name: Verify target & packages are actually selected
         run: |
@@ -189,7 +202,9 @@ jobs:
               echo "  [MISS] $1"; fail=1
             fi
           }
-          echo '== 目标设备 =='
+          echo '== 目标平台/设备 =='
+          check CONFIG_TARGET_mediatek
+          check CONFIG_TARGET_mediatek_filogic
           check CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod
           echo '== 插件 =='
           check CONFIG_PACKAGE_nikki
@@ -240,15 +255,27 @@ jobs:
 
       - name: Collect firmware artifacts
         run: |
-          echo '=== 产物目录 ==='
-          ls -lh bin/targets/mediatek/mt7981/ || true
+          echo '=== bin/targets 实际结构 ==='
+          find bin/targets -maxdepth 3 -type d 2>/dev/null || true
+          # subtarget 输出目录为 filogic；若目录名变化则自动兜底
+          OUTDIR="bin/targets/mediatek/filogic"
+          if [ ! -d "$OUTDIR" ]; then
+            OUTDIR=$(find bin/targets/mediatek -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+          fi
+          echo "使用产物目录: $OUTDIR"
+          test -d "$OUTDIR" || { echo '::error::找不到固件输出目录（镜像未生成，请检查 target/subtarget）'; exit 1; }
+          ls -lh "$OUTDIR"
           mkdir -p firmware
-          cd bin/targets/mediatek/mt7981/
-          # 只打包 cudy tr3000 ubootmod 的刷机产物与清单
-          for f in *cudy*tr3000*ubootmod*; do
-            [ -e "$f" ] && cp -v "$f" "$GITHUB_WORKSPACE/firmware/"
-          done
-          cp -v *.manifest "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+          # 只收集 cudy tr3000 ubootmod 的刷机产物与清单
+          find "$OUTDIR" -maxdepth 1 -type f -name '*cudy*tr3000*ubootmod*' -exec cp -v {} "$GITHUB_WORKSPACE/firmware/" \;
+          find "$OUTDIR" -maxdepth 1 -type f -name '*.manifest' -exec cp -v {} "$GITHUB_WORKSPACE/firmware/" \;
+          # 强制：必须产出 sysupgrade 固件，否则视为失败（避免空产物）
+          if ! find "$GITHUB_WORKSPACE/firmware" -type f -name '*sysupgrade*' | grep -q .; then
+            echo '::error::未生成 sysupgrade 固件（target/install 没有为该设备构建镜像）'
+            echo '=== bin/targets 下全部文件 ==='
+            find bin/targets -type f 2>/dev/null | head -50
+            exit 1
+          fi
           cd "$GITHUB_WORKSPACE/firmware"
           echo '=== 已收集 ==='
           ls -lh
