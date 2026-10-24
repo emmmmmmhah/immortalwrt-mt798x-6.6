@@ -1,0 +1,322 @@
+# =====================================================================
+# Cudy TR3000 v1 (112M / ubootmod) 定制固件 —— GitHub Actions 一键云编译
+# 源码仓库: padavanonly/immortalwrt-mt798x-24.10  分支: openwrt-24.10-6.6（全套 MTK 闭源驱动）
+#
+# 固化配置：
+#   - 设备：cudy_tr3000-v1-ubootmod (112M 大分区, 已刷 uboot)
+#   - 开机默认把 F50 USB 网卡(eth2)设为 WAN（带接口名自适应兜底）
+#   - 插件：OpenClash(内置 Meta 内核, 开箱即用) / homeproxy / AdGuardHome(内置二进制) / ttyd
+#   - 主题：Argon (3.1.x，已集成配置)，并设为开机默认主题
+#   - 默认主页：LuCI 标准状态总览（不做任何仪表盘跳转）
+#   - LAN 默认 IP：192.168.6.1（源码默认值）
+#   - USB 上网驱动全套：RNDIS/NCM/MBIM/QMI + 串口 + 拨号工具 + USB 存储
+#   - 不含 OAF / nikki
+# =====================================================================
+name: Build Cudy TR3000 New (OpenClash/HomeProxy/AGH/ttyd/Argon)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - openwrt-24.10-6.6
+    paths:
+      - .github/workflows/build-cudy-new.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Closed-Source Firmware for Cudy TR3000 112M
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: openwrt-24.10-6.6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-distutils rsync unzip \
+            zlib1g-dev file wget xsltproc docbook-xsl
+
+      - name: Update & install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add OpenClash source (vernesong)
+        run: |
+          # 整个仓库 clone 到 package/，内含 luci-app-openclash（Makefile 会被递归扫描）
+          git clone --depth 1 https://github.com/vernesong/OpenClash.git package/OpenClash
+          ls -la package/OpenClash/luci-app-openclash
+
+      - name: Add Argon theme source (3.1.x, config integrated)
+        run: |
+          # 3.1.x 已把 luci-app-argon-config 配置界面并入主题包，无需单独 config 包
+          git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon.git package/luci-theme-argon
+          ls -la package/luci-theme-argon | head
+
+      - name: Add luci-app-adguardhome (kenzok8, 24.10 compatible)
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/kenzok8/small-package /tmp/sp
+          (cd /tmp/sp && git sparse-checkout set luci-app-adguardhome)
+          rm -rf package/luci-app-adguardhome
+          cp -r /tmp/sp/luci-app-adguardhome package/luci-app-adguardhome
+          ls -la package/luci-app-adguardhome
+
+      - name: Inject eth2 WAN + Argon default theme + OpenClash Meta core
+        run: |
+          mkdir -p files/etc/uci-defaults files/etc/hotplug.d/usb files/etc/openclash/core
+
+          # ---------- 1) 首次开机直接把 wan/wan6 绑定到 eth2 ----------
+          cat > files/etc/uci-defaults/99-f50-eth2-wan <<'EOF'
+          #!/bin/sh
+          # F50 USB 网卡 (eth2) 作为默认 WAN
+          [ -n "$(uci -q get network.wan)" ]  && uci set network.wan.device='eth2'
+          [ -n "$(uci -q get network.wan6)" ] && uci set network.wan6.device='eth2'
+          uci commit network
+          exit 0
+          EOF
+          sed -i 's/^          //' files/etc/uci-defaults/99-f50-eth2-wan
+          chmod +x files/etc/uci-defaults/99-f50-eth2-wan
+
+          # ---------- 2) 兜底：USB 网卡出现时自动识别真实接口名并设为 WAN ----------
+          cat > files/etc/hotplug.d/usb/20-f50-wan <<'EOF'
+          #!/bin/sh
+          # USB 上网卡 (F50/FM350) 出现时自动绑定为 WAN，兼容接口名变化
+          [ "$ACTION" = "add" ] || exit 0
+          find_usb_wan() {
+              for d in /sys/class/net/*; do
+                  [ -e "$d" ] || continue
+                  n=$(basename "$d")
+                  case "$n" in lo|br-*|bond*) continue ;; esac
+                  readlink -f "$d/device" 2>/dev/null | grep -q '/usb' || continue
+                  echo "$n"; return 0
+              done
+              return 1
+          }
+          usbif=""
+          for i in $(seq 1 20); do
+              usbif=$(find_usb_wan)
+              [ -n "$usbif" ] && break
+              sleep 1
+          done
+          [ -z "$usbif" ] && exit 0
+          cur=$(uci -q get network.wan.device)
+          if [ "$cur" != "$usbif" ]; then
+              uci set network.wan.device="$usbif"
+              [ -n "$(uci -q get network.wan6)" ] && uci set network.wan6.device="$usbif"
+              uci commit network
+              ifup wan 2>/dev/null
+              ifup wan6 2>/dev/null
+          fi
+          exit 0
+          EOF
+          sed -i 's/^          //' files/etc/hotplug.d/usb/20-f50-wan
+          chmod +x files/etc/hotplug.d/usb/20-f50-wan
+
+          # ---------- 3) Argon 设为开机默认主题 ----------
+          cat > files/etc/uci-defaults/99-argon-theme <<'EOF'
+          #!/bin/sh
+          uci set luci.main.mediaurlbase='/luci-static/argon'
+          uci commit luci
+          exit 0
+          EOF
+          sed -i 's/^          //' files/etc/uci-defaults/99-argon-theme
+          chmod +x files/etc/uci-defaults/99-argon-theme
+
+          # ---------- 4) 内置 OpenClash Meta 内核（arm64，对应 MT7981），开箱即用 ----------
+          CORE_FILE="files/etc/openclash/core/clash_meta"
+          URLS="https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-linux-arm64.tar.gz https://cdn.jsdelivr.net/gh/vernesong/OpenClash@core/master/meta/clash-linux-arm64.tar.gz"
+          ok=0
+          for u in $URLS; do
+            echo "下载 OpenClash 内核: $u"
+            if wget -q --timeout=45 -O /tmp/clash_meta.tar.gz "$u" && gzip -t /tmp/clash_meta.tar.gz 2>/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = "1" ] || { echo '::error::OpenClash Meta 内核下载失败，请检查网络/地址'; exit 1; }
+          tar -xzf /tmp/clash_meta.tar.gz -C /tmp
+          mv -f /tmp/clash "$CORE_FILE"
+          chmod 0755 "$CORE_FILE"
+          file "$CORE_FILE"
+          ls -lh "$CORE_FILE"
+
+          echo '=== 99-f50-eth2-wan ==='; cat files/etc/uci-defaults/99-f50-eth2-wan
+          echo '=== 99-argon-theme ==='; cat files/etc/uci-defaults/99-argon-theme
+          echo '=== 20-f50-wan ==='; cat files/etc/hotplug.d/usb/20-f50-wan
+
+      - name: Generate .config (target device + packages)
+        run: |
+          cp defconfig/mt7981-ax3000.config .config
+
+          # --- 关键修正：模板写的是旧 subtarget 名 mt7981，当前分支已改名为 filogic，
+          #     不修正会导致 target/install 不生成任何镜像（编译成功但无固件）---
+          sed -i 's#^CONFIG_TARGET_mediatek_mt7981=y#CONFIG_TARGET_mediatek_filogic=y#' .config
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y' .config || echo 'CONFIG_TARGET_mediatek_filogic=y' >> .config
+
+          # --- 取消模板默认选中的所有设备，只保留 Cudy TR3000 v1 112M (ubootmod) ---
+          sed -i -E 's#^CONFIG_TARGET_DEVICE_([A-Za-z0-9_]+_DEVICE_[A-Za-z0-9_.-]+)=y#\# CONFIG_TARGET_DEVICE_\1 is not set#' .config
+          echo 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' >> .config
+
+          # --- 插件 ---
+          cat >> .config <<'EOF'
+
+          # ===== 用户定制插件 =====
+          # OpenClash（界面 + 依赖；内核已内置到 files/etc/openclash/core）
+          CONFIG_PACKAGE_luci-app-openclash=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_bash=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_ruby=y
+          CONFIG_PACKAGE_ruby-yaml=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_unzip=y
+          # 网页终端 ttyd + 中文
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+          # homeproxy 代理工具集（sing-box）
+          CONFIG_PACKAGE_luci-app-homeproxy=y
+          # AdGuardHome（界面 + 随固件内置官方二进制，开箱即用）
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-app-adguardhome_INCLUDE_binary=y
+          # Argon 主题（3.1.x 已集成配置界面 + 简中翻译）
+          CONFIG_PACKAGE_luci-theme-argon=y
+
+          # ===== F50 / USB 上网驱动全套 =====
+          CONFIG_PACKAGE_kmod-usb-net-rndis=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
+          CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial-option=y
+          CONFIG_PACKAGE_kmod-usb-acm=y
+          CONFIG_PACKAGE_uqmi=y
+          CONFIG_PACKAGE_umbim=y
+          CONFIG_PACKAGE_comgt=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-usb-storage-uas=y
+          EOF
+          sed -i 's/^          //' .config
+
+          # 两次 defconfig，确保 subtarget choice 与设备 profile 完全收敛
+          make defconfig
+          make defconfig
+
+          echo '=== 最终 target 选择（必须为 filogic + cudy ubootmod）==='
+          grep -E '^CONFIG_TARGET_mediatek=y|^CONFIG_TARGET_mediatek_filogic=y|^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' .config
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y' .config || { echo '::error::subtarget 未选中 filogic'; exit 1; }
+          grep -q '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' .config || { echo '::error::cudy tr3000 ubootmod 设备未选中'; exit 1; }
+
+      - name: Verify target & packages are actually selected
+        run: |
+          fail=0
+          check() {
+            if grep -q "^$1=y" .config; then
+              echo "  [OK]   $1"
+            else
+              echo "  [MISS] $1"; fail=1
+            fi
+          }
+          echo '== 目标平台/设备 =='
+          check CONFIG_TARGET_mediatek
+          check CONFIG_TARGET_mediatek_filogic
+          check CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod
+          echo '== 核心插件（缺一即失败）=='
+          check CONFIG_PACKAGE_luci-app-openclash
+          check CONFIG_PACKAGE_luci-app-ttyd
+          check CONFIG_PACKAGE_luci-app-homeproxy
+          check CONFIG_PACKAGE_luci-app-adguardhome
+          check CONFIG_PACKAGE_adguardhome
+          check CONFIG_PACKAGE_luci-theme-argon
+          echo '== OpenClash 依赖 =='
+          check CONFIG_PACKAGE_luci-compat
+          check CONFIG_PACKAGE_dnsmasq-full
+          check CONFIG_PACKAGE_ruby
+          check CONFIG_PACKAGE_ruby-yaml
+          check CONFIG_PACKAGE_kmod-tun
+          check CONFIG_PACKAGE_kmod-nft-tproxy
+          check CONFIG_PACKAGE_kmod-inet-diag
+          echo '== USB 上网驱动（缺一即失败）=='
+          check CONFIG_PACKAGE_kmod-usb-net-rndis
+          check CONFIG_PACKAGE_kmod-usb-net-cdc-ncm
+          check CONFIG_PACKAGE_kmod-usb-net-cdc-mbim
+          check CONFIG_PACKAGE_kmod-usb-net-qmi-wwan
+          check CONFIG_PACKAGE_kmod-usb-serial-option
+          check CONFIG_PACKAGE_kmod-usb-acm
+          check CONFIG_PACKAGE_uqmi
+          check CONFIG_PACKAGE_umbim
+          check CONFIG_PACKAGE_comgt
+          check CONFIG_PACKAGE_kmod-usb-storage
+          check CONFIG_PACKAGE_kmod-usb-storage-uas
+          echo '== 内置 OpenClash 内核文件 =='
+          if [ -s files/etc/openclash/core/clash_meta ]; then
+            echo '  [OK]   files/etc/openclash/core/clash_meta 非空'
+            file files/etc/openclash/core/clash_meta
+          else
+            echo '  [MISS] files/etc/openclash/core/clash_meta'; fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo '::error::存在未选中的关键包/内核，请检查包名/源，终止编译'
+            grep -n -E 'openclash|ttyd|homeproxy|adguard|argon|ruby|dnsmasq|usb-net|uqmi|umbim|comgt' .config | head -120
+            exit 1
+          fi
+
+      - name: Download sources
+        run: |
+          make download -j"$(nproc)"
+
+      - name: Compile firmware
+        run: |
+          if ! make -j"$(nproc)"; then
+            echo '::warning::并行编译失败，改用单线程重试以定位错误'
+            make -j1 V=s
+          fi
+
+      - name: Collect firmware artifacts
+        run: |
+          echo '=== bin/targets 实际结构 ==='
+          find bin/targets -maxdepth 3 -type d 2>/dev/null || true
+          OUTDIR="bin/targets/mediatek/filogic"
+          if [ ! -d "$OUTDIR" ]; then
+            OUTDIR=$(find bin/targets/mediatek -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+          fi
+          echo "使用产物目录: $OUTDIR"
+          test -d "$OUTDIR" || { echo '::error::找不到固件输出目录（镜像未生成，请检查 target/subtarget）'; exit 1; }
+          ls -lh "$OUTDIR"
+          mkdir -p firmware
+          find "$OUTDIR" -maxdepth 1 -type f -name '*cudy*tr3000*ubootmod*' -exec cp -v {} "$GITHUB_WORKSPACE/firmware/" \;
+          find "$OUTDIR" -maxdepth 1 -type f -name '*.manifest' -exec cp -v {} "$GITHUB_WORKSPACE/firmware/" \;
+          if ! find "$GITHUB_WORKSPACE/firmware" -type f -name '*sysupgrade*' | grep -q .; then
+            echo '::error::未生成 sysupgrade 固件（target/install 没有为该设备构建镜像）'
+            echo '=== bin/targets 下全部文件 ==='
+            find bin/targets -type f 2>/dev/null | head -50
+            exit 1
+          fi
+          cd "$GITHUB_WORKSPACE/firmware"
+          echo '=== 已收集 ==='
+          ls -lh
+          echo '=== 清单中确认关键包 ==='
+          grep -E 'openclash|homeproxy|adguardhome|ttyd|argon|ruby|dnsmasq-full|usb-net|uqmi|umbim|comgt' *.manifest || true
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudy-tr3000-112m-new-fw
+          path: firmware/
+          retention-days: 14
+          if-no-files-found: error
