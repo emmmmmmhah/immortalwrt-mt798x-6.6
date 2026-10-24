@@ -157,7 +157,6 @@ jobs:
           # --- 关键修正：模板写的是旧 subtarget 名 mt7981，当前分支已改名为 filogic，
           #     不修正会导致 target/install 不生成任何镜像（编译成功但无固件）---
           sed -i 's#^CONFIG_TARGET_mediatek_mt7981=y#CONFIG_TARGET_mediatek_filogic=y#' .config
-          sed -i 's#^CONFIG_TARGET_mediatek_mt7981=## CONFIG_TARGET_mediatek_mt7981 is not set#' .config
           grep -q '^CONFIG_TARGET_mediatek_filogic=y' .config || echo 'CONFIG_TARGET_mediatek_filogic=y' >> .config
 
           # --- 取消模板默认选中的所有设备，只保留 Cudy TR3000 v1 112M (ubootmod) ---
