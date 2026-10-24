@@ -1,0 +1,264 @@
+# =====================================================================
+# Cudy TR3000 v1 (112M / ubootmod) 定制固件 —— GitHub Actions 一键云编译
+# 源码仓库: padavanonly/immortalwrt-mt798x-24.10  分支: openwrt-24.10-6.6
+#
+# 固化配置：
+#   - 设备：cudy_tr3000-v1-ubootmod (112M, 已刷 uboot)
+#   - 开机默认把 F50 USB 网卡(eth2)设为 WAN（带接口名自适应兜底）
+#   - 插件：nikki / ttyd / homeproxy / AdGuardHome
+#   - OAF 应用过滤(luci-app-oaf)：编入并保持出厂待命(默认无规则、不关 HNAT，不影响 F50 高速)
+#   - 登录后保持 LuCI 原版默认主页（状态概览），不做 OAF 首页跳转；OAF 仍在服务菜单中可用
+#   - USB 上网驱动全套：RNDIS/NCM/MBIM/QMI + 串口 + 拨号工具 + USB 存储
+# =====================================================================
+name: Build Cudy TR3000 112M Firmware (Default Home)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - openwrt-24.10-6.6
+    paths:
+      - .github/workflows/build-cudy-default.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ImmortalWrt for Cudy TR3000 112M (default home)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: openwrt-24.10-6.6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-distutils rsync unzip \
+            zlib1g-dev file wget xsltproc docbook-xsl
+
+      - name: Add nikki third-party feed
+        run: |
+          echo '' >> feeds.conf.default
+          echo '# nikki (mihomo transparent proxy)' >> feeds.conf.default
+          echo 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' >> feeds.conf.default
+          echo '--- feeds.conf.default ---'
+          cat feeds.conf.default
+
+      - name: Update & install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add luci-app-adguardhome (kenzok8, 24.10 compatible)
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/kenzok8/small-package /tmp/sp
+          (cd /tmp/sp && git sparse-checkout set luci-app-adguardhome)
+          rm -rf package/luci-app-adguardhome
+          cp -r /tmp/sp/luci-app-adguardhome package/luci-app-adguardhome
+          ls -la package/luci-app-adguardhome
+
+      - name: Add OpenAppFilter (luci-app-oaf) source
+        run: |
+          # 官方源码编译法：整包 clone 到 package/，含 kmod-oaf / appfilter / luci-app-oaf
+          git clone https://github.com/destan19/OpenAppFilter.git package/OpenAppFilter
+          ls -la package/OpenAppFilter
+
+      - name: Inject F50 USB (eth2) default WAN config
+        run: |
+          mkdir -p files/etc/uci-defaults files/etc/hotplug.d/usb
+
+          # 1) 首次开机直接把 wan/wan6 绑定到 eth2（用户要求）
+          cat > files/etc/uci-defaults/99-f50-eth2-wan <<'EOF'
+          #!/bin/sh
+          # F50 USB 网卡 (eth2) 作为默认 WAN
+          [ -n "$(uci -q get network.wan)" ]  && uci set network.wan.device='eth2'
+          [ -n "$(uci -q get network.wan6)" ] && uci set network.wan6.device='eth2'
+          uci commit network
+          exit 0
+          EOF
+          # 去掉 heredoc 内容可能带上的前导缩进
+          sed -i 's/^          //' files/etc/uci-defaults/99-f50-eth2-wan
+          chmod +x files/etc/uci-defaults/99-f50-eth2-wan
+
+          # 2) 兜底：USB 网卡插入/开机时自动识别真实接口名(eth2/eth1/usb0)并设为 WAN
+          cat > files/etc/hotplug.d/usb/20-f50-wan <<'EOF'
+          #!/bin/sh
+          # USB 上网卡 (F50/FM350) 出现时自动绑定为 WAN，兼容接口名变化
+          [ "$ACTION" = "add" ] || exit 0
+          find_usb_wan() {
+              for d in /sys/class/net/*; do
+                  [ -e "$d" ] || continue
+                  n=$(basename "$d")
+                  case "$n" in lo|br-*|bond*) continue ;; esac
+                  readlink -f "$d/device" 2>/dev/null | grep -q '/usb' || continue
+                  echo "$n"; return 0
+              done
+              return 1
+          }
+          usbif=""
+          for i in $(seq 1 20); do
+              usbif=$(find_usb_wan)
+              [ -n "$usbif" ] && break
+              sleep 1
+          done
+          [ -z "$usbif" ] && exit 0
+          cur=$(uci -q get network.wan.device)
+          if [ "$cur" != "$usbif" ]; then
+              uci set network.wan.device="$usbif"
+              [ -n "$(uci -q get network.wan6)" ] && uci set network.wan6.device="$usbif"
+              uci commit network
+              ifup wan 2>/dev/null
+              ifup wan6 2>/dev/null
+          fi
+          exit 0
+          EOF
+          sed -i 's/^          //' files/etc/hotplug.d/usb/20-f50-wan
+          chmod +x files/etc/hotplug.d/usb/20-f50-wan
+
+          echo '=== 99-f50-eth2-wan ==='; cat files/etc/uci-defaults/99-f50-eth2-wan
+          echo '=== 20-f50-wan ==='; cat files/etc/hotplug.d/usb/20-f50-wan
+
+      - name: Generate .config (target device + packages)
+        run: |
+          cp defconfig/mt7981-ax3000.config .config
+
+          # --- 取消模板默认选中的所有设备，只保留 Cudy TR3000 v1 112M (ubootmod) ---
+          sed -i -E 's#^CONFIG_TARGET_DEVICE_([A-Za-z0-9_]+_DEVICE_[A-Za-z0-9_.-]+)=y#\# CONFIG_TARGET_DEVICE_\1 is not set#' .config
+          echo 'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y' >> .config
+
+          # --- 插件 ---
+          cat >> .config <<'EOF'
+
+          # ===== 用户定制插件 =====
+          # nikki (mihomo 透明代理) + 中文
+          CONFIG_PACKAGE_nikki=y
+          CONFIG_PACKAGE_luci-app-nikki=y
+          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
+          # 网页终端 ttyd + 中文
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+          # homeproxy 代理工具集
+          CONFIG_PACKAGE_luci-app-homeproxy=y
+          # AdGuardHome (界面 + 随固件内置官方二进制，开箱即用)
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-app-adguardhome_INCLUDE_binary=y
+          # OAF 应用过滤（内核包 kmod-oaf 必须显式选择：make defconfig 不会因界面依赖自动带出 KernelPackage）
+          CONFIG_PACKAGE_kmod-oaf=y
+          CONFIG_PACKAGE_appfilter=y
+          CONFIG_PACKAGE_luci-app-oaf=y
+          CONFIG_PACKAGE_luci-i18n-oaf-zh-cn=y
+          CONFIG_PACKAGE_kmod-nf-conntrack=y
+          CONFIG_PACKAGE_kmod-nf-reject=y
+
+          # ===== F50 / USB 上网驱动全套 =====
+          CONFIG_PACKAGE_kmod-usb-net-rndis=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
+          CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial-option=y
+          CONFIG_PACKAGE_kmod-usb-acm=y
+          CONFIG_PACKAGE_uqmi=y
+          CONFIG_PACKAGE_umbim=y
+          CONFIG_PACKAGE_comgt=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-usb-storage-uas=y
+          EOF
+          sed -i 's/^          //' .config
+
+          make defconfig
+
+      - name: Verify target & packages are actually selected
+        run: |
+          fail=0
+          check() {
+            if grep -q "^$1=y" .config; then
+              echo "  [OK]   $1"
+            else
+              echo "  [MISS] $1"; fail=1
+            fi
+          }
+          echo '== 目标设备 =='
+          check CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod
+          echo '== 插件 =='
+          check CONFIG_PACKAGE_nikki
+          check CONFIG_PACKAGE_luci-app-nikki
+          check CONFIG_PACKAGE_luci-i18n-nikki-zh-cn
+          check CONFIG_PACKAGE_luci-app-ttyd
+          check CONFIG_PACKAGE_luci-app-homeproxy
+          check CONFIG_PACKAGE_luci-app-adguardhome
+          check CONFIG_PACKAGE_adguardhome
+          echo '== OAF 应用过滤 =='
+          check CONFIG_PACKAGE_luci-app-oaf
+          check CONFIG_PACKAGE_luci-i18n-oaf-zh-cn
+          check CONFIG_PACKAGE_kmod-oaf
+          check CONFIG_PACKAGE_appfilter
+          check CONFIG_PACKAGE_kmod-nf-conntrack
+          check CONFIG_PACKAGE_kmod-nf-reject
+          echo '== USB 上网驱动 =='
+          check CONFIG_PACKAGE_kmod-usb-net-rndis
+          check CONFIG_PACKAGE_kmod-usb-net-cdc-ncm
+          check CONFIG_PACKAGE_kmod-usb-net-cdc-mbim
+          check CONFIG_PACKAGE_kmod-usb-net-qmi-wwan
+          check CONFIG_PACKAGE_kmod-usb-serial-option
+          check CONFIG_PACKAGE_kmod-usb-acm
+          check CONFIG_PACKAGE_uqmi
+          check CONFIG_PACKAGE_umbim
+          check CONFIG_PACKAGE_comgt
+          check CONFIG_PACKAGE_kmod-usb-storage
+          check CONFIG_PACKAGE_kmod-usb-storage-uas
+          echo '== 依赖（nikki 自动拉取） =='
+          check CONFIG_PACKAGE_kmod-tun
+          check CONFIG_PACKAGE_kmod-nft-tproxy
+          if [ "$fail" -ne 0 ]; then
+            echo '::error::存在未选中的关键包，请检查包名/源，终止编译'
+            grep -n -E 'nikki|ttyd|homeproxy|adguard|oaf|appfilter|usb-net|uqmi|umbim|comgt' .config | head -100
+            exit 1
+          fi
+
+      - name: Download sources
+        run: |
+          make download -j"$(nproc)"
+
+      - name: Compile firmware
+        run: |
+          if ! make -j"$(nproc)"; then
+            echo '::warning::并行编译失败，改用单线程重试以定位错误'
+            make -j1 V=s
+          fi
+
+      - name: Collect firmware artifacts
+        run: |
+          echo '=== 产物目录 ==='
+          ls -lh bin/targets/mediatek/mt7981/ || true
+          mkdir -p firmware
+          cd bin/targets/mediatek/mt7981/
+          # 只打包 cudy tr3000 ubootmod 的刷机产物与清单
+          for f in *cudy*tr3000*ubootmod*; do
+            [ -e "$f" ] && cp -v "$f" "$GITHUB_WORKSPACE/firmware/"
+          done
+          cp -v *.manifest "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+          cd "$GITHUB_WORKSPACE/firmware"
+          echo '=== 已收集 ==='
+          ls -lh
+          echo '=== 清单中确认关键包 ==='
+          grep -E 'nikki|ttyd|homeproxy|adguard|oaf|appfilter|usb-net|uqmi|umbim|comgt' *.manifest || true
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudy-tr3000-112m-firmware-default-home
+          path: firmware/
+          retention-days: 14
+          if-no-files-found: error
