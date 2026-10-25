@@ -1,0 +1,425 @@
+# =============================================================================
+# Cudy TR3000 v1 (MT7981B / filogic / 112M U-Boot 布局) 闭源无线固件云端编译
+#
+#   底座：emmmmmmhah/immortalwrt-mt798x-6.6 @ openwrt-24.10-6.6
+#         （MTK 闭源 WiFi + 内核 6.6，已在 TR3000 v1 实机验证）
+#   设备：只编 cudy_tr3000-v1-ubootmod（112M），不编 64M / 256M
+#   插件：luci-app-openclash / luci-app-adguardhome(内置二进制) / luci-app-ttyd
+#   可选：WITH_FANCH=true 时尝试加 Fanchmwrt fwx 企业功能包（失败可改 false 重跑）
+#
+#   产物：*ubootmod*sysupgrade.bin —— tar 容器，与设备现用 OpenWrt-U-Boot 一致
+# =============================================================================
+name: build-closedsrc-tr3000
+
+on:
+  workflow_dispatch:
+    inputs:
+      WITH_FANCH:
+        description: "尝试加装 Fanchmwrt fwx 企业功能包（编不过就改 false 重跑）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      BUNDLE_CLASH_CORE:
+        description: "把 OpenClash Meta 内核一起打进固件（离线可用，失败仅告警）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  CLOSED_REPO: emmmmmmhah/immortalwrt-mt798x-6.6
+  CLOSED_BRANCH: openwrt-24.10-6.6
+  PROFILE: cudy_tr3000-v1-ubootmod
+  PROFILE_64M: cudy_tr3000-v1
+  PROFILE_256M: cudy_tr3000-v1-256mb
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 0. 磁盘与编译环境依赖
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-distutils python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget xsltproc quilt cpio bc \
+            libelf-dev docbook-xsl time zstd
+          df -h /
+
+      - name: 1. 检出闭源 6.6 底座（含本仓库的 defconfig/ 与 .github/）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CLOSED_REPO }}
+          ref: ${{ env.CLOSED_BRANCH }}
+          fetch-depth: 1
+          path: openwrt
+          persist-credentials: false
+
+      - name: 2. 编译前体检（源码树必须满足的前提）
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          echo "== HEAD =="; git rev-parse HEAD
+          echo
+          echo "== 必须存在 ubootmod 设备定义 =="
+          grep -n "Device/${{ env.PROFILE }}\$" target/linux/mediatek/image/filogic.mk
+          echo
+          echo "== ubootmod 关键参数（期望 IMAGE_SIZE 114688k / sysupgrade-tar / KERNEL_IN_UBI） =="
+          sed -n '/^define Device\/${{ env.PROFILE }}/,/^endef/p' \
+            target/linux/mediatek/image/filogic.mk \
+            | grep -E "DEVICE_DTS|IMAGE_SIZE|UBINIZE_OPTS|BLOCKSIZE|PAGESIZE|KERNEL_IN_UBI|sysupgrade|DEVICE_PACKAGES"
+          echo
+          echo "== DTS 必须存在 =="
+          ls -l target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1-ubootmod.dts
+          echo
+          echo "== 闭源驱动包必须存在 =="
+          ls package/mtk/drivers/
+          for d in mt_wifi conninfra warp; do
+            test -d "package/mtk/drivers/$d" || { echo "::error::缺少 package/mtk/drivers/$d，闭源底座不完整"; exit 1; }
+          done
+          echo
+          echo "== 本树不应存在开源 mt76 包（确认走闭源） =="
+          if [ -d package/kernel/mt76 ]; then echo "::error::异常：本树出现了 package/kernel/mt76"; exit 1; fi
+          if grep -rqs "KernelPackage/mt7915" package/kernel/ ; then echo "::error::异常：发现 KernelPackage/mt7915 定义"; exit 1; fi
+          echo "OK：没有开源 mt7915 包定义（filogic.mk 里的 kmod-mt7915e 是悬空名，会被静默丢弃）"
+          echo
+          echo "== 闭源基线 defconfig =="
+          ls -l defconfig/mt7981-ax3000.config
+
+      - name: 3. 加入三插件（OpenClash / AdGuardHome / ttyd）
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          # --- OpenClash ---
+          rm -rf package/OpenClash
+          git clone --depth 1 https://github.com/vernesong/OpenClash.git package/OpenClash
+          test -f package/OpenClash/luci-app-openclash/Makefile \
+            || { echo "::error::OpenClash 源码结构异常（缺 luci-app-openclash/Makefile）"; exit 1; }
+
+          # --- AdGuardHome：只从 kenzok8 取 LuCI 应用 ---
+          # 二进制包改用 feeds 自带的 net/adguardhome 0.107.57：
+          # kenzok8 那份是 0.107.79，go.mod 要求 go 1.26.6，而本树 golang 只有 1.23.12，
+          # 且 golang-package.mk 强制 GOTOOLCHAIN=local（不会自动下工具链）→ 必然编译失败。
+          rm -rf /tmp/sp package/luci-app-adguardhome
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/kenzok8/small-package.git /tmp/sp
+          cd /tmp/sp
+          git sparse-checkout set --no-cone luci-app-adguardhome
+          git read-tree -mu HEAD || true
+          cd "$GITHUB_WORKSPACE/openwrt"
+          test -d /tmp/sp/luci-app-adguardhome \
+            || { echo "::error::small-package 里缺 luci-app-adguardhome"; exit 1; }
+          cp -a /tmp/sp/luci-app-adguardhome package/
+          test -f package/luci-app-adguardhome/Makefile \
+            || { echo "::error::luci-app-adguardhome 没拷进来"; exit 1; }
+
+          echo "== 插件就位 =="
+          ls -d package/OpenClash/luci-app-openclash package/luci-app-adguardhome
+
+      - name: 4.（可选）加入 Fanchmwrt fwx feed
+        if: ${{ github.event.inputs.WITH_FANCH == 'true' }}
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          if ! grep -q "src-git fanchmwrt" feeds.conf.default; then
+            echo "src-git fanchmwrt https://github.com/fanchmwrt/fanchmwrt-packages.git" >> feeds.conf.default
+          fi
+          grep fanchmwrt feeds.conf.default
+
+      - name: 5. 更新并安装 feeds
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # feeds 里也有一份 luci-app-openclash（0.47.156），会与 vernesong 的 0.48.002 同名冲突，
+          # 删掉 feed 版链接，只保留 package/OpenClash 里那份。
+          if [ -e package/feeds/luci/luci-app-openclash ]; then
+            rm -rf package/feeds/luci/luci-app-openclash
+            echo "已移除 feeds 里的 luci-app-openclash（保留 vernesong 版）"
+          fi
+
+          # AdGuardHome 二进制包用 packages feed 自带的 0.107.57（与 golang 1.23.12 兼容）
+          ./scripts/feeds install adguardhome
+          test -d package/feeds/packages/adguardhome \
+            || { echo "::error::packages feed 里没有 adguardhome"; exit 1; }
+          grep -m1 '^PKG_VERSION' package/feeds/packages/adguardhome/Makefile || true
+
+          echo "== 关键包是否可解析 =="
+          for p in luci-app-ttyd luci-app-openclash luci-app-adguardhome adguardhome; do
+            if ./scripts/feeds list -n 2>/dev/null | grep -qx "$p"; then echo "  OK   $p"; else echo "  WARN $p 不在 feeds 索引（本地目录包可能仍可用）"; fi
+          done
+          test -e package/feeds/luci/luci-app-ttyd || { echo "::error::luci feed 里没有 luci-app-ttyd"; exit 1; }
+
+      - name: 6. 生成 .config（闭源基线 + 只锁 ubootmod + 三插件）
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          # 6.1 用仓库自带的闭源 MT7981 基线（已含 MTK_CHIP_MT7981 / CONNINFRA / WARP / hnat 等 Kconfig）
+          cp defconfig/mt7981-ax3000.config .config
+
+          # 6.2 旧 subtarget 名 mt7981 -> filogic
+          sed -i 's#^CONFIG_TARGET_mediatek_mt7981=y#CONFIG_TARGET_mediatek_filogic=y#' .config
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y$' .config \
+            || echo 'CONFIG_TARGET_mediatek_filogic=y' >> .config
+
+          # 6.3 清空基线里所有已选设备，只留 ubootmod（避免编出别的机型 / 多 profile 冲突）
+          sed -i -E 's#^CONFIG_TARGET_DEVICE_([A-Za-z0-9_]+_DEVICE_[A-Za-z0-9_.-]+)=y#\# CONFIG_TARGET_DEVICE_\1 is not set#' .config
+          sed -i -E '/^CONFIG_TARGET_DEVICE_PACKAGES_/d' .config
+
+          # 6.4 单设备 + 多 profile 开关（没有 MULTI_PROFILE，DEVICE_ 行会被 defconfig 丢弃）
+          cat >> .config <<'EOF'
+          CONFIG_TARGET_MULTI_PROFILE=y
+          CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+          CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y
+          EOF
+
+          # 6.5 闭源无线 / 硬件加速（显式钉死，防 defconfig 回落默认）
+          cat >> .config <<'EOF'
+          CONFIG_MTK_WIFI_DRIVER=y
+          CONFIG_MTK_CHIP_MT7981=y
+          CONFIG_MTK_FIRST_IF_MT7981=y
+          CONFIG_MTK_MT7981_NEW_FW=y
+          CONFIG_MTK_CONNINFRA_APSOC=y
+          CONFIG_MTK_CONNINFRA_APSOC_MT7981=y
+          CONFIG_CONNINFRA_AUTO_UP=y
+          CONFIG_MTK_WARP_V2=y
+          CONFIG_WARP_CHIPSET="mt7981"
+          CONFIG_WARP_VERSION=2
+          CONFIG_PACKAGE_kmod-mt_wifi=y
+          CONFIG_PACKAGE_kmod-conninfra=y
+          CONFIG_PACKAGE_kmod-mediatek_hnat=y
+          CONFIG_PACKAGE_kmod-warp=y
+          CONFIG_PACKAGE_wifi-dats=y
+          CONFIG_PACKAGE_mtwifi-cfg=y
+          CONFIG_PACKAGE_luci-app-mtwifi-cfg=y
+          EOF
+
+          # 6.6 三插件（不多不少）
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-openclash=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-app-adguardhome_INCLUDE_binary=y
+          CONFIG_PACKAGE_dnsmasq-full=y
+          # CONFIG_PACKAGE_dnsmasq is not set
+          EOF
+
+          # 6.7 可选 fwx
+          if [ "${{ github.event.inputs.WITH_FANCH }}" = "true" ]; then
+            cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-fwx-resources=y
+          CONFIG_PACKAGE_luci-app-fwx-dashboard-setting=y
+          CONFIG_PACKAGE_luci-app-fwx-app-center=y
+          CONFIG_PACKAGE_luci-app-fwx-appfilter=y
+          EOF
+          fi
+
+          sed -i 's/^          //' .config
+
+          echo "===== 展开前 .config 行数：$(wc -l < .config) ====="
+
+      - name: 7. make defconfig 并审计关键符号（不合格就提前失败，不浪费 3 小时）
+        working-directory: openwrt
+        run: |
+          set -uo pipefail
+          make defconfig
+          make defconfig
+
+          # dnsmasq 与 dnsmasq-full 同时存在会导致打包冲突，强行只留 full
+          if grep -qE '^CONFIG_PACKAGE_dnsmasq=y$' .config; then
+            sed -i 's#^CONFIG_PACKAGE_dnsmasq=y#\# CONFIG_PACKAGE_dnsmasq is not set#' .config
+            make defconfig
+          fi
+
+          echo "========== 关键配置审计 =========="
+          FAIL=0
+          for k in \
+            CONFIG_TARGET_mediatek_filogic=y \
+            CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cudy_tr3000-v1-ubootmod=y \
+            CONFIG_MTK_CHIP_MT7981=y \
+            CONFIG_MTK_FIRST_IF_MT7981=y \
+            CONFIG_PACKAGE_kmod-mt_wifi=y \
+            CONFIG_PACKAGE_kmod-conninfra=y \
+            CONFIG_PACKAGE_kmod-mediatek_hnat=y \
+            CONFIG_PACKAGE_kmod-warp=y \
+            CONFIG_PACKAGE_wifi-dats=y \
+            CONFIG_PACKAGE_luci-app-openclash=y \
+            CONFIG_PACKAGE_luci-app-adguardhome=y \
+            CONFIG_PACKAGE_luci-app-adguardhome_INCLUDE_binary=y \
+            CONFIG_PACKAGE_adguardhome=y \
+            CONFIG_PACKAGE_luci-app-ttyd=y
+          do
+            if grep -qx "$k" .config; then
+              echo "  OK   $k"
+            else
+              echo "  MISS $k"
+              FAIL=1
+            fi
+          done
+
+          echo "-- 必须不存在的开源无线 --"
+          for k in '^CONFIG_PACKAGE_kmod-mt76' '^CONFIG_PACKAGE_kmod-mt7915e=y' '^CONFIG_PACKAGE_kmod-mt7981-firmware=y'; do
+            if grep -qE "$k" .config; then echo "  BAD  $k 被选中"; FAIL=1; else echo "  OK   无 $k"; fi
+          done
+
+          echo "-- 设备选择必须唯一为 ubootmod --"
+          grep -E '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config || true
+          N=$(grep -cE '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config)
+          echo "  选中的 filogic 设备数：$N"
+          if [ "$N" != "1" ]; then echo "  BAD 设备数不为 1"; FAIL=1; fi
+          if grep -qE "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_(${{ env.PROFILE_64M }}|${{ env.PROFILE_256M }})=y$" .config; then
+            echo "  BAD 选中了 64M/256M 机型"; FAIL=1
+          fi
+
+          if [ -f .config ]; then ./scripts/diffconfig.sh > /tmp/diffconfig.txt 2>/dev/null || true; fi
+          echo "========== diffconfig（关键项） =========="
+          grep -Ei 'TARGET_DEVICE|mt_wifi|conninfra|hnat|warp|openclash|adguard|ttyd|mt7915|mt76|fwx' /tmp/diffconfig.txt || true
+
+          if [ "$FAIL" = "1" ]; then echo "::error::.config 审计未通过，见上方 MISS/BAD 项"; exit 1; fi
+          echo "配置审计通过"
+
+      - name: 8.（可选）内置 OpenClash Meta 内核
+        if: ${{ github.event.inputs.BUNDLE_CLASH_CORE != 'false' }}
+        working-directory: openwrt
+        run: |
+          set -uo pipefail
+          mkdir -p files/etc/openclash/core
+          URL1="https://raw.githubusercontent.com/vernesong/OpenClash/core/master/meta/clash-linux-arm64.tar.gz"
+          URL2="https://cdn.jsdelivr.net/gh/vernesong/OpenClash@core/meta/clash-linux-arm64.tar.gz"
+          OK=0
+          for u in "$URL1" "$URL2"; do
+            if curl -fsSL --retry 3 --connect-timeout 20 -o /tmp/clash.tar.gz "$u"; then OK=1; break; fi
+          done
+          if [ "$OK" = "1" ]; then
+            tar -xzf /tmp/clash.tar.gz -C /tmp
+            CORE=$(find /tmp -maxdepth 2 -type f -name 'clash*' ! -name '*.gz' | head -1 || true)
+            if [ -n "${CORE:-}" ]; then
+              install -m 0755 "$CORE" files/etc/openclash/core/clash_meta
+              ls -lh files/etc/openclash/core/
+            else
+              echo "::warning::解压后未找到 clash 可执行文件，跳过内置内核"
+            fi
+          else
+            echo "::warning::Meta 内核下载失败，跳过内置（不影响固件与 OpenClash 界面）"
+          fi
+
+      - name: 9. 下载源码包（容错）
+        working-directory: openwrt
+        run: |
+          set -o pipefail
+          make download -j"$(nproc)" 2>&1 | tail -100
+          # 再跑一次补齐个别超时/404 的包；仍失败不在这里中断，交给 make 报真实错误
+          make download -j8 2>&1 | tail -40 || echo "::warning::部分下载包失败，编译阶段会再次尝试"
+
+      - name: 10. 编译（失败自动 -j1 复跑拿真实报错）
+        working-directory: openwrt
+        timeout-minutes: 300
+        run: |
+          set -o pipefail
+          echo "开始编译：$(date -u +%FT%TZ)  nproc=$(nproc)"
+          if make -j"$(nproc)" 2>&1 | tail -200; then
+            echo "编译成功（并行）"
+          else
+            echo "::warning::并行编译失败，改用 -j1 V=s 复跑以获取真实报错（已编译部分会复用）"
+            make -j1 V=s 2>&1 | tail -400
+          fi
+          echo "编译结束：$(date -u +%FT%TZ)"
+          ls -lh bin/targets/mediatek/filogic/ || true
+
+      - name: 11. 验收硬门
+        working-directory: openwrt
+        run: |
+          set -uo pipefail
+          BIN=bin/targets/mediatek/filogic
+          if [ ! -d "$BIN" ]; then
+            BIN=$(find bin/targets/mediatek -mindepth 1 -maxdepth 1 -type d | head -1)
+          fi
+          echo "== 产物目录：$BIN =="
+          ls -lh "$BIN" || { echo "::error::没有任何产物目录"; exit 1; }
+
+          FAIL=0
+          M=$(ls "$BIN"/*.manifest 2>/dev/null | head -1 || true)
+          echo "manifest: ${M:-<无>}"
+          if [ -z "${M:-}" ]; then
+            echo "::error::没有 .manifest，无法验证包清单"; exit 1
+          fi
+
+          echo "-- 硬门 1：必需包 --"
+          for k in kmod-mt_wifi kmod-conninfra kmod-mediatek_hnat kmod-warp \
+                   luci-app-openclash luci-app-adguardhome luci-app-ttyd; do
+            if grep -qE "(^|[[:space:]])${k}[[:space:]]" "$M"; then echo "  OK   $k"; else echo "  MISS $k"; FAIL=1; fi
+          done
+
+          echo "-- 硬门 2：不得含开源 mt7915e --"
+          if grep -q 'kmod-mt7915e' "$M"; then echo "  BAD  manifest 含 kmod-mt7915e（说明没走闭源）"; FAIL=1; else echo "  OK   无 kmod-mt7915e"; fi
+          if grep -q '^kmod-mt76' "$M"; then echo "  BAD  manifest 含 kmod-mt76*"; FAIL=1; fi
+
+          echo "-- 硬门 3：产物名与格式 --"
+          SYSUP=$(ls "$BIN"/*${{ env.PROFILE }}*sysupgrade.bin 2>/dev/null | head -1 || true)
+          echo "sysupgrade: ${SYSUP:-<无>}"
+          if [ -z "${SYSUP:-}" ]; then echo "  BAD  没有 *${{ env.PROFILE }}*sysupgrade.bin"; FAIL=1; fi
+          if ls "$BIN"/*${{ env.PROFILE_64M }}* 2>/dev/null | grep -qv ubootmod; then
+            echo "  BAD  出现了 64M 机型产物"; FAIL=1
+          fi
+          if ls "$BIN"/*${{ env.PROFILE_256M }}* 2>/dev/null | head -1 | grep -q .; then
+            echo "  BAD  出现了 256M 机型产物"; FAIL=1
+          fi
+          if [ -n "${SYSUP:-}" ]; then
+            SZ=$(stat -c %s "$SYSUP")
+            echo "  镜像大小：$SZ 字节（$((SZ/1024/1024)) MiB，期望 ≤112MiB 且非 64M 布局）"
+            if [ "$SZ" -gt $((112*1024*1024)) ]; then echo "  BAD  超过 112MiB"; FAIL=1; fi
+            if [ "$SZ" -lt $((20*1024*1024)) ]; then echo "  BAD  体积异常小（疑似非完整镜像）"; FAIL=1; fi
+            echo "  容器类型：$(file -b "$SYSUP")"
+          fi
+
+          echo "-- 附加信息：闭源驱动实际打包 --"
+          grep -E '^kmod-(mt_wifi|conninfra|mediatek_hnat|warp)' "$M" || echo "  （无匹配，需人工核查）"
+
+          echo "-- fwx 包 --"
+          grep -Ei 'fwx' "$M" || echo "  （未包含 fwx 包）"
+
+          if [ "$FAIL" = "1" ]; then echo "::error::验收硬门未通过，见上方 BAD/MISS"; exit 1; fi
+          echo "全部硬门通过"
+
+      - name: 12. 收集固件
+        if: always()
+        working-directory: openwrt
+        run: |
+          set -uo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/firmware"
+          BIN=bin/targets/mediatek/filogic
+          [ -d "$BIN" ] || BIN=$(find bin/targets/mediatek -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+          if [ -n "${BIN:-}" ] && [ -d "$BIN" ]; then
+            ls -lh "$BIN"
+            cp -v "$BIN"/*${{ env.PROFILE }}* "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+            cp -v "$BIN"/*.manifest "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+            cp -v "$BIN"/sha256sums "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+            cp -v "$BIN"/profiles.json "$GITHUB_WORKSPACE/firmware/" 2>/dev/null || true
+          fi
+          cp -v .config "$GITHUB_WORKSPACE/firmware/config.txt" 2>/dev/null || true
+          ./scripts/diffconfig.sh > "$GITHUB_WORKSPACE/firmware/diffconfig.txt" 2>/dev/null || true
+          echo "== 待上传 =="; ls -lh "$GITHUB_WORKSPACE/firmware" || true
+
+      - name: 13. 上传固件产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tr3000-closedsrc-${{ github.event.inputs.WITH_FANCH == 'true' && 'fanch' || 'nofanch' }}
+          path: |
+            firmware/*
+          if-no-files-found: error
+          retention-days: 30
